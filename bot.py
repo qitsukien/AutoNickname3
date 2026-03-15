@@ -3,15 +3,17 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import unicodedata
+import zipfile
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import discord
-from discord.ext import commands
 from discord import app_commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 
@@ -21,28 +23,156 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CONFIG_PATH = Path("config.json")
 DB_PATH = Path("registrations.db")
 EXPORTS_DIR = Path("exports")
+EXPORT_ARCHIVES_DIR = EXPORTS_DIR / "archive"
+BADWORDS_PATH = Path("badwords.json")
+BACKUPS_DIR = Path("backups")
+
+DEFAULT_CONFIG = {
+    "guild_id": 0,
+    "registration_channel_id": 0,
+    "log_channel_id": 0,
+    "welcome_channel_id": 0,
+    "unregistered_role_id": 0,
+    "member_role_id": 0,
+    "rename_cooldown_hours": 24,
+    "registration_message_id": 0,
+    "backup_interval_hours": 24,
+    "backup_max_files": 5,
+    "last_auto_backup_at": None,
+    "registration_attempt_cooldown_seconds": 15,
+    "exports_archive_max_files": 5,
+}
+
+DEFAULT_BADWORDS = [
+    "хуй", "хуйня", "хуе", "хуё", "хуев", "хуёв", "хуесос", "хуила", "хуило",
+    "пизда", "пиздец", "пизду", "пизды", "пизд", "пидор", "пидорас",
+    "пидорасина", "ебать", "ебан", "ёбан", "ебуч", "ёбуч", "бля", "бляд",
+    "блять", "блядь", "сука", "шлюха", "шалава", "мразь", "гандон", "гондон",
+    "мудак", "долбоеб", "долбоёб", "уеб", "уёб", "нахуй", "наху", "похуй",
+    "fuck", "fucking", "fucker", "motherfucker", "bitch", "bitches", "slut",
+    "whore", "asshole", "dick", "cock", "pussy", "cunt", "bastard", "shit",
+    "bullshit", "retard", "niga", "nigger", "nigga"
+]
+
+
+BADWORDS_CACHE: list[str] = []
+DEFAULT_BADWORDS_CACHE: Optional[list[str]] = None
+REGISTRATION_ATTEMPTS: dict[tuple[int, int], datetime] = {}
+REGISTRATION_PROCESSING_USERS: set[tuple[int, int]] = set()
+REGISTRATION_STATE_LOCK = threading.Lock()
+
+
+def ensure_runtime_files() -> None:
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    EXPORT_ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUPS_DIR.mkdir(exist_ok=True)
+
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(
+            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    if not BADWORDS_PATH.exists():
+        BADWORDS_PATH.write_text(
+            json.dumps({"words": []}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+
+def build_default_config(current: Optional[dict] = None) -> dict:
+    data = dict(DEFAULT_CONFIG)
+    if isinstance(current, dict):
+        data.update(current)
+    return data
+
+
+def ensure_int_config(value: object, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
 
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError("Файл config.json не найден.")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    ensure_runtime_files()
+
+    try:
+        raw_text = CONFIG_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        cfg = build_default_config()
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cfg
+
+    if not raw_text:
+        cfg = build_default_config()
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cfg
+
+    try:
+        raw_cfg = json.loads(raw_text)
+    except json.JSONDecodeError:
+        backup_path = CONFIG_PATH.with_suffix(".broken.json")
+        try:
+            CONFIG_PATH.replace(backup_path)
+        except OSError:
+            pass
+        cfg = build_default_config()
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cfg
+
+    if not isinstance(raw_cfg, dict):
+        cfg = build_default_config()
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cfg
+
+    cfg = build_default_config(raw_cfg)
+    cfg["rename_cooldown_hours"] = max(0, ensure_int_config(cfg.get("rename_cooldown_hours"), 24))
+    cfg["registration_message_id"] = max(0, ensure_int_config(cfg.get("registration_message_id"), 0))
+    cfg["backup_interval_hours"] = max(1, ensure_int_config(cfg.get("backup_interval_hours"), 24))
+    cfg["backup_max_files"] = max(1, ensure_int_config(cfg.get("backup_max_files"), 5))
+    cfg["registration_attempt_cooldown_seconds"] = max(0, ensure_int_config(cfg.get("registration_attempt_cooldown_seconds"), 15))
+    cfg["exports_archive_max_files"] = max(1, ensure_int_config(cfg.get("exports_archive_max_files"), 5))
+
+    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 
 config = load_config()
-GUILD_ID = int(config["guild_id"])
+save_config(config)
+
+
+def load_last_auto_backup_at() -> Optional[datetime]:
+    raw = config.get("last_auto_backup_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def save_last_auto_backup_at(dt: Optional[datetime]) -> None:
+    config["last_auto_backup_at"] = dt.isoformat() if dt else None
+    save_config(config)
+
+
+GUILD_ID = int(config.get("guild_id", 0) or 0)
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+LAST_AUTO_BACKUP_AT: Optional[datetime] = load_last_auto_backup_at()
 
 
 class LogType(Enum):
@@ -52,18 +182,20 @@ class LogType(Enum):
     RENAME = "rename"
     ADMIN = "admin"
     ERROR = "error"
+    BACKUP = "backup"
 
 
 class AdminAction(Enum):
     DELETE_DB_USER = "delete_db_user"
     RESET_DB_USER = "reset_db_user"
+    RESTORE_FROM_DB = "restore_from_db"
 
 
 # =========================
 # Антимат только для имени
 # =========================
 
-LEET_MAP = {
+BASE_CHAR_MAP = {
     "@": "a",
     "4": "a",
     "3": "e",
@@ -77,61 +209,62 @@ LEET_MAP = {
     "+": "t",
     "8": "b",
     "9": "g",
+    "6": "b",
+}
+
+LATIN_TO_CYRILLIC_SIMILAR = {
+    "a": "а",
+    "b": "б",
+    "c": "с",
+    "d": "д",
+    "e": "е",
+    "f": "ф",
+    "g": "г",
+    "h": "н",
+    "i": "и",
+    "j": "й",
+    "k": "к",
+    "l": "л",
+    "m": "м",
+    "n": "п",
+    "o": "о",
+    "p": "р",
+    "q": "к",
+    "r": "г",
+    "s": "с",
+    "t": "т",
+    "u": "и",
+    "v": "в",
+    "x": "х",
+    "y": "у",
+    "z": "з",
 }
 
 CYRILLIC_TO_LATIN_SIMILAR = {
     "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
     "е": "e",
     "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "j",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "h",
     "о": "o",
+    "п": "n",
     "р": "p",
     "с": "c",
-    "у": "y",
-    "х": "x",
-    "к": "k",
-    "м": "m",
     "т": "t",
-    "в": "b",
-    "н": "h",
+    "у": "y",
+    "ф": "f",
+    "х": "x",
 }
-
-RU_PROFANITY_PATTERNS = [
-    r"ху[йиеяюёйлл]*",
-    r"пизд[аыуюеёитьец]*",
-    r"еб[а-яё]*",
-    r"ёб[а-яё]*",
-    r"бля[а-яё]*",
-    r"бляд[а-яё]*",
-    r"сук[а-яё]*",
-    r"муд[а-яё]*",
-    r"гандон[а-яё]*",
-    r"пид[а-яё]*р",
-    r"педик[а-яё]*",
-    r"долбоеб[а-яё]*",
-    r"уеб[а-яё]*",
-    r"заеб[а-яё]*",
-    r"наеб[а-яё]*",
-    r"поеб[а-яё]*",
-    r"выеб[а-яё]*",
-    r"оху[а-яё]*",
-    r"ниху[а-яё]*",
-]
-
-EN_PROFANITY_PATTERNS = [
-    r"f+u+c+k+",
-    r"f+\W*u+\W*c+\W*k+",
-    r"b+i+t+c+h+",
-    r"s+h+i+t+",
-    r"d+i+c+k+",
-    r"p+u+s+s+y+",
-    r"w+h+o+r+e+",
-    r"s+l+u+t+",
-    r"m+o+t+h+e+r+f+u+c+k+e*r*",
-    r"n+i+g+g+[ae]r*",
-    r"f+a+g+[go]t*",
-    r"c+u+n+t+",
-    r"a+s+s+h+o+l+e+",
-]
 
 
 def strip_diacritics(text: str) -> str:
@@ -139,46 +272,233 @@ def strip_diacritics(text: str) -> str:
     return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
-def normalize_leetspeak(text: str) -> str:
-    return "".join(LEET_MAP.get(ch, ch) for ch in text)
+def normalize_base_symbols(text: str) -> str:
+    return "".join(BASE_CHAR_MAP.get(ch, ch) for ch in text)
 
 
-def normalize_similar_letters(text: str) -> str:
-    return "".join(CYRILLIC_TO_LATIN_SIMILAR.get(ch.lower(), ch.lower()) for ch in text)
+def normalize_to_cyrillic(text: str) -> str:
+    return "".join(LATIN_TO_CYRILLIC_SIMILAR.get(ch.lower(), ch.lower()) for ch in text)
+
+
+def normalize_to_latin(text: str) -> str:
+    result = []
+    for ch in text.lower():
+        mapped = CYRILLIC_TO_LATIN_SIMILAR.get(ch, ch)
+        result.append(mapped)
+    return "".join(result)
 
 
 def collapse_separators(text: str) -> str:
     return re.sub(r"[^a-zа-яё0-9]", "", text, flags=re.IGNORECASE)
 
 
-def build_text_variants(text: str) -> list[str]:
+def normalize_repeated_letters(text: str) -> str:
+    return re.sub(r"(.)\1{2,}", r"\1\1", text)
+
+
+def build_text_variants(text: str) -> dict[str, list[str]]:
     text = text.lower()
     text = strip_diacritics(text)
-    text = normalize_leetspeak(text)
+    text = normalize_base_symbols(text)
 
-    variant_1 = text
-    variant_2 = normalize_similar_letters(text)
-    variant_3 = collapse_separators(variant_1)
-    variant_4 = collapse_separators(variant_2)
+    raw = text
+    raw_collapsed = collapse_separators(raw)
 
-    unique: list[str] = []
-    for item in [variant_1, variant_2, variant_3, variant_4]:
-        if item not in unique:
-            unique.append(item)
-    return unique
+    ru_1 = normalize_to_cyrillic(raw)
+    ru_2 = collapse_separators(ru_1)
+    ru_3 = normalize_repeated_letters(ru_2)
+
+    en_1 = normalize_to_latin(raw)
+    en_2 = collapse_separators(en_1)
+    en_3 = normalize_repeated_letters(en_2)
+
+    def unique(items: list[str]) -> list[str]:
+        result = []
+        for item in items:
+            if item not in result:
+                result.append(item)
+        return result
+
+    return {
+        "ru": unique([ru_1, ru_2, ru_3]),
+        "en": unique([en_1, en_2, en_3]),
+        "raw": unique([raw, raw_collapsed]),
+    }
+
+
+def normalize_custom_badword(word: str) -> str:
+    word = strip_diacritics(word.lower().strip())
+    word = normalize_base_symbols(word)
+    word = collapse_separators(word)
+    return word
+
+
+def get_default_badwords() -> list[str]:
+    global DEFAULT_BADWORDS_CACHE
+
+    if DEFAULT_BADWORDS_CACHE is not None:
+        return DEFAULT_BADWORDS_CACHE.copy()
+
+    cleaned = []
+    seen = set()
+
+    for word in DEFAULT_BADWORDS:
+        normalized = normalize_custom_badword(word)
+        if normalized and len(normalized) >= 3 and normalized not in seen:
+            cleaned.append(normalized)
+            seen.add(normalized)
+
+    DEFAULT_BADWORDS_CACHE = sorted(cleaned)
+    return DEFAULT_BADWORDS_CACHE.copy()
+
+
+def load_badwords(force_reload: bool = False) -> dict:
+    global BADWORDS_CACHE
+
+    ensure_runtime_files()
+
+    if BADWORDS_CACHE and not force_reload:
+        return {"words": BADWORDS_CACHE.copy()}
+
+    try:
+        with open(BADWORDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            data = {"words": []}
+
+        words = data.get("words", [])
+        if not isinstance(words, list):
+            words = []
+
+        cleaned_words = []
+        seen = set()
+
+        for word in words:
+            if not isinstance(word, str):
+                continue
+            normalized = normalize_custom_badword(word)
+            if normalized and len(normalized) >= 3 and normalized not in seen:
+                cleaned_words.append(normalized)
+                seen.add(normalized)
+
+        BADWORDS_CACHE = sorted(cleaned_words)
+        save_badwords({"words": BADWORDS_CACHE})
+        return {"words": BADWORDS_CACHE.copy()}
+
+    except (json.JSONDecodeError, OSError):
+        BADWORDS_CACHE = []
+        save_badwords({"words": []})
+        return {"words": []}
+
+
+def save_badwords(data: dict) -> None:
+    global BADWORDS_CACHE
+
+    ensure_runtime_files()
+    words = data.get("words", []) if isinstance(data, dict) else []
+    BADWORDS_CACHE = list(words) if isinstance(words, list) else []
+
+    with open(BADWORDS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"words": BADWORDS_CACHE}, f, ensure_ascii=False, indent=2)
+
+
+def get_custom_badwords() -> list[str]:
+    data = load_badwords()
+    return data.get("words", []).copy()
+
+
+def add_custom_badword(word: str) -> tuple[bool, str]:
+    normalized = normalize_custom_badword(word)
+    if not normalized:
+        return False, "После нормализации слово оказалось пустым."
+    if len(normalized) < 3:
+        return False, "Слово должно содержать минимум 3 символа после нормализации."
+    if normalized in get_default_badwords():
+        return False, "Это слово уже есть во встроенном списке."
+
+    data = load_badwords()
+    words = set(data.get("words", []))
+    if normalized in words:
+        return False, "Это слово уже есть в пользовательском списке."
+
+    words.add(normalized)
+    data["words"] = sorted(words)
+    save_badwords(data)
+    return True, normalized
+
+
+def remove_custom_badword(word: str) -> tuple[bool, str]:
+    normalized = normalize_custom_badword(word)
+    data = load_badwords()
+    words = set(data.get("words", []))
+
+    if normalized not in words:
+        if normalized in get_default_badwords():
+            return False, "Это слово находится во встроенном списке и не удаляется через эту команду."
+        return False, "Такого слова нет в пользовательском списке."
+
+    words.remove(normalized)
+    data["words"] = sorted(words)
+    save_badwords(data)
+    return True, normalized
+
+
+def clear_custom_badwords() -> None:
+    save_badwords({"words": []})
+
+
+def export_badwords_to_json() -> Path:
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    file_path = EXPORTS_DIR / f"badwords_export_{timestamp}.json"
+
+    data = {
+        "default_words": get_default_badwords(),
+        "custom_words": get_custom_badwords(),
+    }
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    archive_old_exports()
+    return file_path
+
+
+def contains_badword_from_list(text: str, words: list[str]) -> Optional[str]:
+    variants = build_text_variants(text)
+    all_variants = variants["raw"] + variants["ru"] + variants["en"]
+
+    for badword in words:
+        if not badword or len(badword) < 3:
+            continue
+
+        badword_ru = normalize_to_cyrillic(badword)
+        badword_en = normalize_to_latin(badword)
+
+        badword_variants = {
+            collapse_separators(badword),
+            collapse_separators(badword_ru),
+            collapse_separators(badword_en),
+        }
+
+        for variant in all_variants:
+            collapsed_variant = collapse_separators(variant)
+            for bw in badword_variants:
+                if bw and bw in collapsed_variant:
+                    return badword
+
+    return None
 
 
 def contains_profanity(text: str) -> tuple[bool, Optional[str]]:
-    variants = build_text_variants(text)
+    default_match = contains_badword_from_list(text, get_default_badwords())
+    if default_match:
+        return True, f"DEFAULT:{default_match}"
 
-    for variant in variants:
-        for pattern in RU_PROFANITY_PATTERNS:
-            if re.search(pattern, variant, flags=re.IGNORECASE):
-                return True, f"RU:{pattern}"
-
-        for pattern in EN_PROFANITY_PATTERNS:
-            if re.search(pattern, variant, flags=re.IGNORECASE):
-                return True, f"EN:{pattern}"
+    custom_match = contains_badword_from_list(text, get_custom_badwords())
+    if custom_match:
+        return True, f"CUSTOM:{custom_match}"
 
     return False, None
 
@@ -223,7 +543,9 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
-    EXPORTS_DIR.mkdir(exist_ok=True)
+
+    ensure_runtime_files()
+    load_badwords(force_reload=True)
 
 
 def get_registration(user_id: int, guild_id: int) -> Optional[sqlite3.Row]:
@@ -250,6 +572,34 @@ def get_all_registrations(guild_id: int) -> list[sqlite3.Row]:
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def get_last_registrations(guild_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM registrations
+        WHERE guild_id = ?
+        ORDER BY updated_at DESC
+        LIMIT ?
+    """, (guild_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def count_registrations(guild_id: int) -> int:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) AS count
+        FROM registrations
+        WHERE guild_id = ?
+    """, (guild_id,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row["count"]) if row else 0
 
 
 def upsert_registration(
@@ -322,17 +672,29 @@ def get_last_rename_time(user_id: int, guild_id: int) -> Optional[datetime]:
     return datetime.fromisoformat(row["changed_at"])
 
 
+def get_name_history(user_id: int, guild_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM rename_history
+        WHERE user_id = ? AND guild_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (user_id, guild_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 def delete_registration(user_id: int, guild_id: int) -> bool:
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("""
         DELETE FROM registrations
         WHERE user_id = ? AND guild_id = ?
     """, (user_id, guild_id))
-
     deleted = cur.rowcount > 0
-
     conn.commit()
     conn.close()
     return deleted
@@ -341,34 +703,14 @@ def delete_registration(user_id: int, guild_id: int) -> bool:
 def delete_rename_history(user_id: int, guild_id: int) -> int:
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("""
         DELETE FROM rename_history
         WHERE user_id = ? AND guild_id = ?
     """, (user_id, guild_id))
-
     deleted_count = cur.rowcount
-
     conn.commit()
     conn.close()
     return deleted_count
-
-
-def get_last_registrations(guild_id: int, limit: int = 10) -> list[sqlite3.Row]:
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT *
-        FROM registrations
-        WHERE guild_id = ?
-        ORDER BY updated_at DESC
-        LIMIT ?
-    """, (guild_id, limit))
-
-    rows = cur.fetchall()
-    conn.close()
-    return rows
 
 
 def export_registrations_to_csv(guild_id: int) -> Optional[Path]:
@@ -403,7 +745,130 @@ def export_registrations_to_csv(guild_id: int) -> Optional[Path]:
                 row["updated_at"],
             ])
 
+    archive_old_exports()
     return file_path
+
+
+def get_exports_archive_max_files() -> int:
+    try:
+        return max(1, int(config.get("exports_archive_max_files", 5)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def list_export_files() -> list[Path]:
+    ensure_runtime_files()
+    return sorted(
+        [p for p in EXPORTS_DIR.glob("*") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+
+def list_export_archives() -> list[Path]:
+    ensure_runtime_files()
+    return sorted(
+        EXPORT_ARCHIVES_DIR.glob("export_archive_*.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+
+def prune_old_export_archives() -> None:
+    archives = list_export_archives()
+    max_files = get_exports_archive_max_files()
+    for old_file in archives[max_files:]:
+        try:
+            old_file.unlink()
+        except OSError:
+            pass
+
+
+def archive_old_exports() -> list[Path]:
+    ensure_runtime_files()
+    export_files = [p for p in list_export_files() if p.parent == EXPORTS_DIR]
+    keep_live = 5
+    archived: list[Path] = []
+
+    for old_file in export_files[keep_live:]:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        zip_path = EXPORT_ARCHIVES_DIR / f"export_archive_{timestamp}_{old_file.stem}.zip"
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(old_file, arcname=old_file.name)
+            old_file.unlink()
+            archived.append(zip_path)
+        except OSError:
+            try:
+                if zip_path.exists():
+                    zip_path.unlink()
+            except OSError:
+                pass
+
+    prune_old_export_archives()
+    return archived
+
+
+# =========================
+# Бэкапы
+# =========================
+
+def ensure_backup_dir() -> None:
+    BACKUPS_DIR.mkdir(exist_ok=True)
+
+
+def get_backup_interval_hours() -> int:
+    try:
+        return max(1, int(config.get("backup_interval_hours", 24)))
+    except (TypeError, ValueError):
+        return 24
+
+
+def get_backup_max_files() -> int:
+    try:
+        return max(1, int(config.get("backup_max_files", 5)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def list_backup_archives() -> list[Path]:
+    ensure_backup_dir()
+    return sorted(
+        BACKUPS_DIR.glob("backup_*.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+
+def prune_old_backups() -> None:
+    archives = list_backup_archives()
+    max_files = get_backup_max_files()
+
+    for old_file in archives[max_files:]:
+        try:
+            old_file.unlink()
+        except OSError:
+            pass
+
+
+def create_backup_bundle() -> list[Path]:
+    ensure_runtime_files()
+    ensure_backup_dir()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    zip_path = BACKUPS_DIR / f"backup_{timestamp}.zip"
+
+    source_files = [DB_PATH, CONFIG_PATH, BADWORDS_PATH]
+    existing_sources = [path for path in source_files if path.exists()]
+
+    if not existing_sources:
+        return []
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for source in existing_sources:
+            zf.write(source, arcname=source.name)
+
+    prune_old_backups()
+    return [zip_path]
 
 
 # =========================
@@ -411,20 +876,174 @@ def export_registrations_to_csv(guild_id: int) -> Optional[Path]:
 # =========================
 
 def is_valid_name(name: str) -> bool:
-    name = name.strip()
+    name = re.sub(r"\s+", " ", name.strip())
     if not (2 <= len(name) <= 20):
         return False
     return bool(re.fullmatch(r"[А-Яа-яЁё -]+", name))
 
 
-def extract_base_name(member: discord.Member) -> str:
-    source = member.nick if member.nick else member.name
-    match = re.match(r"^(.*?)\s*\([^()]+\)\s*$", source)
-    return match.group(1).strip() if match else source.strip()
+def normalize_real_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip())
 
+
+def capitalize_name_part(part: str) -> str:
+    if not part:
+        return part
+    return part[0].upper() + part[1:].lower()
+
+
+def format_real_name(name: str) -> str:
+    name = normalize_real_name(name)
+    words = []
+    for word in name.split(" "):
+        hyphen_parts = [capitalize_name_part(part) for part in word.split("-")]
+        words.append("-".join(hyphen_parts))
+    return " ".join(words)
+
+
+def get_name_letters(name: str) -> list[str]:
+    return [ch.lower() for ch in name if ch.isalpha()]
+
+
+def has_too_many_repeated_letters(name: str) -> bool:
+    return re.search(r"(.)\1{2,}", name.lower()) is not None
+
+
+def has_required_vowels(name: str) -> bool:
+    vowels = "аеёиоуыэюя"
+    lowered = name.lower()
+    return any(vowel in lowered for vowel in vowels)
+
+
+def looks_like_keyboard_smash(name: str) -> bool:
+    cleaned = normalize_real_name(name)
+    letters = get_name_letters(cleaned)
+
+    if not letters:
+        return True
+
+    unique_letters = set(letters)
+    if len(letters) >= 4 and len(unique_letters) <= 2:
+        return True
+
+    if len(letters) >= 5 and has_too_many_repeated_letters(cleaned):
+        return True
+
+    if len(letters) >= 4 and not has_required_vowels(cleaned):
+        return True
+
+    consonant_groups = re.findall(r"[бвгджзйклмнпрстфхцчшщ]{4,}", cleaned.lower())
+    if consonant_groups:
+        return True
+
+    return False
+
+
+def looks_like_garbage(name: str) -> bool:
+    name = normalize_real_name(name).lower()
+    letters = [c for c in name if c.isalpha()]
+
+    if len(letters) < 2:
+        return True
+
+    text = "".join(letters)
+
+    vowels = "аеёиоуыэюя"
+    consonants = "бвгджзйклмнпрстфхцчшщ"
+
+    vowel_count = sum(1 for c in text if c in vowels)
+    consonant_count = sum(1 for c in text if c in consonants)
+
+    # слишком мало разных букв
+    if len(set(text)) <= 2:
+        return True
+
+    # слишком низкое разнообразие символов
+    if len(set(text)) / len(text) < 0.45:
+        return True
+
+    # слишком много одинаковых подряд
+    if re.search(r"(.)\1{2,}", text):
+        return True
+
+    # нет гласных
+    if vowel_count == 0:
+        return True
+
+    # слишком мало гласных
+    if vowel_count / len(text) < 0.25:
+        return True
+
+    # слишком длинная цепочка согласных
+    if re.search(rf"[{consonants}]{{4,}}", text):
+        return True
+
+    # слишком много согласных относительно гласных
+    if consonant_count > vowel_count * 2:
+        return True
+
+    # типичные keyboard smash паттерны
+    keyboard_smashes = (
+        "qwerty", "asdf", "zxcv", "йцук", "фыва", "ячсм",
+        "цук", "куц", "рпра", "прар", "трвг", "вгд", "ghbdtn"
+    )
+    if any(seq in text for seq in keyboard_smashes):
+        return True
+
+    return False
+
+def analyze_name(name: str) -> dict:
+    original = normalize_real_name(name)
+    suggested = format_real_name(original)
+    valid = is_valid_name(suggested)
+    found_profanity, matched_rule = contains_profanity(suggested)
+    garbage_name = looks_like_garbage(suggested)
+
+    reason = None
+    if found_profanity:
+        reason = "Имя содержит запрещённые слова или их маскировку."
+    elif garbage_name:
+        reason = "Имя выглядит как случайный набор букв. Введите настоящее имя."
+    elif not valid:
+        if len(suggested) < 2:
+            reason = "Имя слишком короткое. Минимум 2 символа."
+        elif len(suggested) > 20:
+            reason = "Имя слишком длинное. Максимум 20 символов."
+        else:
+            reason = "Разрешены только русские буквы, пробелы и дефис."
+
+    return {
+        "original": original,
+        "suggested": suggested,
+        "valid": valid,
+        "found_profanity": found_profanity,
+        "matched_rule": matched_rule,
+        "garbage_name": garbage_name,
+        "ok": valid and not found_profanity and not garbage_name,
+        "reason": reason,
+        "changed_case": original != suggested,
+    }
+
+def extract_base_name(member: discord.Member) -> str:
+    source = member.display_name
+
+    match = re.match(r"^(.*?)\s*\([^()]+\)\s*$", source)
+    base = match.group(1).strip() if match else source.strip()
+
+    return base or member.display_name
 
 def build_nickname(base_name: str, real_name: str) -> str:
-    return f"{base_name} ({real_name})"
+    suffix = f" ({real_name})"
+    full = f"{base_name}{suffix}"
+
+    if len(full) <= 32:
+        return full
+
+    max_base_len = max(1, 32 - len(suffix))
+    trimmed_base = base_name[:max_base_len].rstrip()
+    if not trimmed_base:
+        trimmed_base = base_name[:max_base_len]
+    return f"{trimmed_base}{suffix}"
 
 
 def get_unregistered_role(guild: discord.Guild) -> Optional[discord.Role]:
@@ -433,6 +1052,16 @@ def get_unregistered_role(guild: discord.Guild) -> Optional[discord.Role]:
 
 def get_member_role(guild: discord.Guild) -> Optional[discord.Role]:
     return guild.get_role(int(config["member_role_id"]))
+
+
+def get_unregistered_role_name(guild: discord.Guild) -> str:
+    role = get_unregistered_role(guild)
+    return role.name if role else "Не выбрана"
+
+
+def get_member_role_name(guild: discord.Guild) -> str:
+    role = get_member_role(guild)
+    return role.name if role else "Не выбрана"
 
 
 def get_registration_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -453,6 +1082,58 @@ def get_welcome_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
 def format_dt(iso_str: str) -> str:
     dt = datetime.fromisoformat(iso_str)
     return dt.strftime("%d.%m.%Y %H:%M UTC")
+
+
+def get_registration_attempt_cooldown_seconds() -> int:
+    try:
+        return max(0, int(config.get("registration_attempt_cooldown_seconds", 15)))
+    except (TypeError, ValueError):
+        return 15
+
+
+def check_registration_antispam(user_id: int, guild_id: int) -> tuple[bool, Optional[str]]:
+    cooldown_seconds = get_registration_attempt_cooldown_seconds()
+    if cooldown_seconds <= 0:
+        return True, None
+
+    key = (guild_id, user_id)
+    now = datetime.now(timezone.utc)
+    last_attempt = REGISTRATION_ATTEMPTS.get(key)
+    if last_attempt is not None:
+        elapsed = (now - last_attempt).total_seconds()
+        if elapsed < cooldown_seconds:
+            remaining = max(1, int(cooldown_seconds - elapsed))
+            return False, f"Слишком часто. Подождите **{remaining} сек.** и попробуйте снова."
+
+    REGISTRATION_ATTEMPTS[key] = now
+    return True, None
+
+
+def begin_registration_processing(user_id: int, guild_id: int) -> bool:
+    key = (guild_id, user_id)
+    with REGISTRATION_STATE_LOCK:
+        if key in REGISTRATION_PROCESSING_USERS:
+            return False
+        REGISTRATION_PROCESSING_USERS.add(key)
+        return True
+
+
+def end_registration_processing(user_id: int, guild_id: int) -> None:
+    key = (guild_id, user_id)
+    with REGISTRATION_STATE_LOCK:
+        REGISTRATION_PROCESSING_USERS.discard(key)
+
+
+def log_internal_exception(prefix: str, error: Exception) -> None:
+    print(f"{prefix}: {type(error).__name__}: {error}")
+
+
+def is_admin_interaction(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    return interaction.user.guild_permissions.administrator
 
 
 def make_success_embed(title: str, description: str) -> discord.Embed:
@@ -499,50 +1180,59 @@ def make_info_embed(title: str, description: str) -> discord.Embed:
     return embed
 
 
-def make_registration_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="🛡️ Регистрация участников",
-        description=(
-            "Добро пожаловать на сервер.\n"
-            "Для доступа ко всем каналам пройдите короткую регистрацию."
-        ),
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
+async def ensure_message_pinned(message: Optional[discord.Message]) -> bool:
+    if message is None:
+        return False
 
-    embed.add_field(
-        name="┌ Что нужно сделать",
-        value=(
-            "• Нажмите **«Указать имя»**\n"
-            "• Введите своё имя в появившемся окне\n"
-            "• Бот добавит имя к вашему нику автоматически"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="├ После регистрации",
-        value=(
-            "• снимется роль **Не зарегистрирован**\n"
-            "• выдастся роль **Участник**\n"
-            "• откроется доступ к серверу"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="└ Ограничения на имя",
-        value=(
-            "• только русские буквы, пробелы и дефис\n"
-            "• без мата, оскорблений и маскировки символами"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text="Нажмите кнопку ниже, чтобы продолжить")
-    return embed
+    try:
+        if not message.pinned:
+            await message.pin(reason="Закрепление Verification Center")
+        return True
+    except discord.Forbidden:
+        print("Нет прав на закрепление сообщения регистрации.")
+        return False
+    except discord.HTTPException as e:
+        print(f"Ошибка при закреплении сообщения регистрации: {e}")
+        return False
 
 
+def make_registration_message_text(guild: discord.Guild) -> str:
+    unreg_name = get_unregistered_role_name(guild)
+    member_name = get_member_role_name(guild)
+
+    return f"""# 🔐 Verification Center
+
+**Добро пожаловать на сервер!**
+
+Перед тем как начать общение,
+необходимо пройти короткую проверку.
+
+━━━━━━━━━━━━━━━━
+
+📌 **Как пройти проверку**
+
+1️⃣ Нажмите кнопку **«Указать имя»**
+2️⃣ Введите своё имя в появившемся окне
+3️⃣ Бот автоматически обновит ваш ник
+
+━━━━━━━━━━━━━━━━
+
+✅ **После успешной проверки**
+
+• снимется роль **{unreg_name}**
+• выдастся роль **{member_name}**
+• откроется доступ ко всем каналам
+
+━━━━━━━━━━━━━━━━
+
+⚠ **Требования к имени**
+
+• только русские буквы
+• допускаются пробелы и дефис
+• без мата и оскорблений
+
+ ‎
+"""
 def make_welcome_embed(member: discord.Member, nickname: str) -> discord.Embed:
     embed = discord.Embed(
         title="🎉 Новый участник",
@@ -591,6 +1281,7 @@ def make_log_embed(
         LogType.RENAME: {"color": discord.Color.gold(), "emoji": "✏️"},
         LogType.ADMIN: {"color": discord.Color.dark_teal(), "emoji": "🛠️"},
         LogType.ERROR: {"color": discord.Color.red(), "emoji": "⚠️"},
+        LogType.BACKUP: {"color": discord.Color.dark_blue(), "emoji": "💾"},
     }
 
     style = styles[log_type]
@@ -626,6 +1317,98 @@ def make_log_embed(
     return embed
 
 
+def build_user_db_embed_from_member(member: discord.Member, registration: sqlite3.Row) -> discord.Embed:
+    embed = discord.Embed(
+        title="🗂️ Запись пользователя в базе",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Пользователь", value=f"{member.mention}\n`{member.id}`", inline=False)
+    embed.add_field(name="Discord username", value=registration["discord_name"], inline=True)
+    embed.add_field(name="Имя", value=registration["real_name"], inline=True)
+    embed.add_field(name="Ник", value=registration["nickname"], inline=False)
+    embed.add_field(name="Первая регистрация", value=format_dt(registration["registered_at"]), inline=False)
+    embed.add_field(name="Последнее обновление", value=format_dt(registration["updated_at"]), inline=False)
+    embed.set_footer(text="Database Viewer")
+    return embed
+
+
+def build_user_db_embed_offline(user_id: int, registration: sqlite3.Row) -> discord.Embed:
+    embed = discord.Embed(
+        title="🗂️ Запись пользователя в базе",
+        description="Пользователь сейчас не найден на сервере, но запись в базе существует.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="User ID", value=f"`{user_id}`", inline=False)
+    embed.add_field(name="Discord username", value=registration["discord_name"], inline=True)
+    embed.add_field(name="Имя", value=registration["real_name"], inline=True)
+    embed.add_field(name="Ник", value=registration["nickname"], inline=False)
+    embed.add_field(name="Первая регистрация", value=format_dt(registration["registered_at"]), inline=False)
+    embed.add_field(name="Последнее обновление", value=format_dt(registration["updated_at"]), inline=False)
+    embed.set_footer(text="Database Viewer")
+    return embed
+
+
+def build_name_history_embed(
+    title_text: str,
+    description_text: str,
+    avatar_url: Optional[str],
+    current_real_name: Optional[str],
+    current_nickname: Optional[str],
+    rows: list[sqlite3.Row]
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=title_text,
+        description=description_text,
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    if current_real_name:
+        embed.add_field(
+            name="Текущее имя в базе",
+            value=f"**{current_real_name}**",
+            inline=False
+        )
+
+    if current_nickname:
+        embed.add_field(
+            name="Текущий ник",
+            value=f"`{current_nickname}`",
+            inline=False
+        )
+
+    if rows:
+        lines = []
+        for idx, row in enumerate(rows[:10], start=1):
+            old_name = row["old_real_name"] if row["old_real_name"] else "—"
+            new_name = row["new_real_name"]
+            changed_at = format_dt(row["changed_at"])
+            lines.append(
+                f"**{idx}.** `{changed_at}`\n"
+                f"Старое: **{old_name}**\n"
+                f"Новое: **{new_name}**"
+            )
+        embed.add_field(
+            name=f"Последние изменения ({len(rows)})",
+            value="\n\n".join(lines),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="История изменений",
+            value="Смен имени ещё не было.",
+            inline=False
+        )
+
+    return embed
+
+
 async def send_log(
     guild: discord.Guild,
     log_type: LogType,
@@ -654,6 +1437,80 @@ async def send_log(
         print(f"Ошибка отправки логов: {e}")
 
 
+def build_system_check_embed(guild: discord.Guild) -> discord.Embed:
+    me = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    perms = me.guild_permissions if me else None
+
+    registration_channel = get_registration_channel(guild)
+    log_channel = get_log_channel(guild)
+    welcome_channel = get_welcome_channel(guild)
+    unregistered_role = get_unregistered_role(guild)
+    member_role = get_member_role(guild)
+
+    checks = [
+        ("Manage Roles", perms.manage_roles if perms else False),
+        ("Manage Nicknames", perms.manage_nicknames if perms else False),
+        ("View Audit Log", perms.view_audit_log if perms else False),
+        ("Embed Links", perms.embed_links if perms else False),
+        ("Attach Files", perms.attach_files if perms else False),
+        ("View Channels", perms.view_channel if perms else False),
+        ("Send Messages", perms.send_messages if perms else False),
+    ]
+
+    lines = [f"{'✅' if ok else '❌'} {name}" for name, ok in checks]
+
+    embed = discord.Embed(
+        title="🧪 System Check",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    embed.add_field(
+        name="Каналы",
+        value=(
+            f"Регистрация: {registration_channel.mention if registration_channel else '❌ не найден'}\n"
+            f"Логи: {log_channel.mention if log_channel else '❌ не найден'}\n"
+            f"Welcome: {welcome_channel.mention if welcome_channel else '❌ не найден'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Роли",
+        value=(
+            f"{get_unregistered_role_name(guild)}: {unregistered_role.mention if unregistered_role else '❌ не найдена'}\n"
+            f"{get_member_role_name(guild)}: {member_role.mention if member_role else '❌ не найдена'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Автобэкап",
+        value=(
+            f"Интервал: **{get_backup_interval_hours()} ч.**\n"
+            f"Хранить архивов: **{get_backup_max_files()}**\n"
+            f"Последний автозапуск: **{LAST_AUTO_BACKUP_AT.strftime('%d.%m.%Y %H:%M UTC') if LAST_AUTO_BACKUP_AT else 'ещё не выполнялся'}**\n"
+            f"Антиспам регистрации: **{get_registration_attempt_cooldown_seconds()} сек.**\n"
+            f"Архивов экспортов: **{get_exports_archive_max_files()}**"
+        ),
+        inline=False
+    )
+
+    if me:
+        embed.add_field(
+            name="Позиция бота",
+            value=(
+                f"Верхняя роль бота: {me.top_role.mention if me.top_role else '—'}\n"
+                f"ID бота: `{me.id}`"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(text="Проверьте красные пункты, если что-то не работает")
+    return embed
+
+
 # =========================
 # Постоянное сообщение регистрации
 # =========================
@@ -667,7 +1524,9 @@ async def ensure_registration_message(guild: discord.Guild) -> Optional[discord.
 
     if message_id:
         try:
-            return await channel.fetch_message(message_id)
+            message = await channel.fetch_message(message_id)
+            await ensure_message_pinned(message)
+            return message
         except discord.NotFound:
             pass
         except discord.Forbidden:
@@ -677,10 +1536,10 @@ async def ensure_registration_message(guild: discord.Guild) -> Optional[discord.
             print(f"Ошибка при получении сообщения регистрации: {e}")
             return None
 
-    embed = make_registration_embed()
+    message_text = make_registration_message_text(guild)
 
     try:
-        message = await channel.send(embed=embed, view=RegistrationView())
+        message = await channel.send(message_text, view=RegistrationView())
     except discord.Forbidden:
         print("Нет прав на отправку постоянного сообщения регистрации.")
         return None
@@ -690,6 +1549,7 @@ async def ensure_registration_message(guild: discord.Guild) -> Optional[discord.
 
     config["registration_message_id"] = message.id
     save_config(config)
+    await ensure_message_pinned(message)
     return message
 
 
@@ -702,11 +1562,12 @@ async def refresh_registration_message(guild: discord.Guild) -> bool:
     if not message_id:
         return False
 
-    embed = make_registration_embed()
+    message_text = make_registration_message_text(guild)
 
     try:
         message = await channel.fetch_message(message_id)
-        await message.edit(embed=embed, view=RegistrationView())
+        await message.edit(content=message_text, embed=None, view=RegistrationView())
+        await ensure_message_pinned(message)
         return True
     except discord.NotFound:
         return False
@@ -726,49 +1587,50 @@ async def apply_registration(
     member: discord.Member,
     real_name: str,
     rename_mode: bool = False
-) -> tuple[bool, str]:
+) -> tuple[bool, str, Optional[str]]:
     guild = member.guild
-    real_name = real_name.strip()
+    analysis = analyze_name(real_name)
+    real_name = analysis["suggested"]
 
-    found_profanity, matched_rule = contains_profanity(real_name)
-    if found_profanity:
+    if analysis["found_profanity"]:
         await send_log(
             guild,
             LogType.ERROR,
             "Попытка использовать запрещённое имя",
             (
-                f"Пользователь попытался указать имя: **{real_name}**\n"
-                f"Совпадение: `{matched_rule}`"
+                f"Пользователь попытался указать имя: **{analysis['original']}**\n"
+                f"После нормализации: **{real_name}**\n"
+                f"Совпадение: `{analysis['matched_rule']}`"
             ),
             member=member
         )
         return False, (
             "Имя содержит запрещённые слова или их маскировку.\n"
             "Используйте нормальное имя без мата и оскорблений."
-        )
+        ), None
 
-    if not is_valid_name(real_name):
+    if not analysis["ok"] and not analysis["found_profanity"]:
         return False, (
-            "Имя должно содержать только русские буквы, пробелы или дефис.\n"
-            "Пример: `Денис`, `Анна Мария`, `Анна-Мария`."
-        )
+            analysis["reason"]
+            or "Имя не прошло проверку."
+        ), analysis["suggested"] if analysis["changed_case"] else None
 
     unregistered_role = get_unregistered_role(guild)
     member_role = get_member_role(guild)
 
     if not unregistered_role:
-        return False, "Роль `Не зарегистрирован` не найдена."
+        return False, "Роль незарегистрированных не найдена. Установите её через `/set_unregistered_role`.", None
     if not member_role:
-        return False, "Роль `Участник` не найдена."
+        return False, "Роль участников не найдена. Установите её через `/set_member_role`.", None
 
     already_registered = unregistered_role not in member.roles
     registration = get_registration(member.id, guild.id)
 
     if already_registered and not rename_mode:
-        return False, "Вы уже зарегистрированы. Используйте кнопку **«Изменить имя»**."
+        return False, "Вы уже зарегистрированы. Используйте кнопку **«Изменить имя»**.", None
 
     if rename_mode and not already_registered:
-        return False, "Сначала завершите обычную регистрацию."
+        return False, "Сначала завершите обычную регистрацию.", None
 
     if rename_mode:
         cooldown_hours = int(config.get("rename_cooldown_hours", 24))
@@ -786,7 +1648,11 @@ async def apply_registration(
                 return False, (
                     f"Имя можно менять не чаще одного раза в {cooldown_hours} ч.\n"
                     f"Попробуйте снова через **{hours} ч. {minutes} мин.**"
-                )
+                ), None
+
+    old_nick = member.nick
+    had_unregistered_role = unregistered_role in member.roles
+    had_member_role = member_role in member.roles
 
     base_name = extract_base_name(member)
     new_nick = build_nickname(base_name, real_name)
@@ -797,24 +1663,27 @@ async def apply_registration(
         return False, (
             "Я не смог изменить ник.\n"
             "Проверьте права `Manage Nicknames` и что роль бота выше роли пользователя."
-        )
+        ), None
     except discord.HTTPException:
-        return False, "Discord вернул ошибку при изменении ника."
+        return False, "Discord вернул ошибку при изменении ника.", None
 
     try:
         if not already_registered:
-            if unregistered_role in member.roles:
+            if had_unregistered_role:
                 await member.remove_roles(unregistered_role, reason="Регистрация завершена")
 
-            if member_role not in member.roles:
+            if not had_member_role:
                 await member.add_roles(member_role, reason="Регистрация завершена")
-    except discord.Forbidden:
+    except (discord.Forbidden, discord.HTTPException):
+        try:
+            await member.edit(nick=old_nick, reason="Откат ника после ошибки ролей")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
         return False, (
-            "Ник изменён, но я не смог обновить роли.\n"
-            "Проверьте право `Manage Roles` и позицию роли бота."
-        )
-    except discord.HTTPException:
-        return False, "Ник изменён, но при обновлении ролей произошла ошибка."
+            "Не удалось завершить регистрацию полностью.\n"
+            "Ник был возвращён обратно. Проверьте `Manage Roles` и позицию роли бота."
+        ), None
 
     old_real_name = registration["real_name"] if registration else None
 
@@ -826,19 +1695,24 @@ async def apply_registration(
         nickname=new_nick
     )
 
-    add_rename_history(
-        user_id=member.id,
-        guild_id=guild.id,
-        old_real_name=old_real_name,
-        new_real_name=real_name
+    format_note = (
+        f"\nАвтоформат: **{analysis['original']}** → **{real_name}**"
+        if analysis["changed_case"] else ""
     )
 
     if rename_mode:
+        add_rename_history(
+            user_id=member.id,
+            guild_id=guild.id,
+            old_real_name=old_real_name,
+            new_real_name=real_name
+        )
+
         await send_log(
             guild,
             LogType.RENAME,
             "Имя изменено",
-            f"Пользователь изменил имя на **{real_name}**.\nНовый ник: **{new_nick}**",
+            f"Пользователь изменил имя на **{real_name}**.\nНовый ник: **{new_nick}**{format_note}",
             member=member
         )
     else:
@@ -846,7 +1720,7 @@ async def apply_registration(
             guild,
             LogType.REGISTER,
             "Пользователь зарегистрирован",
-            f"Регистрация завершена.\nИмя: **{real_name}**\nНик: **{new_nick}**",
+            f"Регистрация завершена.\nИмя: **{real_name}**\nНик: **{new_nick}**{format_note}",
             member=member
         )
 
@@ -858,46 +1732,56 @@ async def apply_registration(
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    return True, new_nick
+    suggestion = analysis["suggested"] if analysis["changed_case"] else None
+    return True, new_nick, suggestion
 
 
-async def restore_member_from_db(member: discord.Member) -> tuple[bool, str]:
+async def restore_member_from_db(
+    member: discord.Member,
+    reason_text: str = "Автовосстановление зарегистрированного пользователя",
+    add_log: bool = True
+) -> tuple[bool, str]:
     registration = get_registration(member.id, member.guild.id)
     if not registration:
         return False, "Пользователь не найден в базе."
 
     real_name = registration["real_name"]
-    new_nick = build_nickname(member.name, real_name)
+    base_name = extract_base_name(member)
+    new_nick = build_nickname(base_name, real_name)
 
     unregistered_role = get_unregistered_role(member.guild)
     member_role = get_member_role(member.guild)
 
+    old_nick = member.nick
+    had_unregistered_role = bool(unregistered_role and unregistered_role in member.roles)
+    had_member_role = bool(member_role and member_role in member.roles)
+
     try:
-        await member.edit(
-            nick=new_nick,
-            reason="Автовосстановление зарегистрированного пользователя"
-        )
+        await member.edit(nick=new_nick, reason=reason_text)
     except discord.Forbidden:
         return False, "Не удалось восстановить ник: нет прав."
     except discord.HTTPException:
         return False, "Не удалось восстановить ник из-за ошибки Discord."
 
     try:
-        if unregistered_role and unregistered_role in member.roles:
+        if unregistered_role and had_unregistered_role:
             await member.remove_roles(
                 unregistered_role,
                 reason="Пользователь уже зарегистрирован в базе"
             )
 
-        if member_role and member_role not in member.roles:
+        if member_role and not had_member_role:
             await member.add_roles(
                 member_role,
                 reason="Восстановление роли зарегистрированного пользователя"
             )
-    except discord.Forbidden:
-        return False, "Ник восстановлен, но не удалось обновить роли."
-    except discord.HTTPException:
-        return False, "Ник восстановлен, но произошла ошибка при обновлении ролей."
+    except (discord.Forbidden, discord.HTTPException):
+        try:
+            await member.edit(nick=old_nick, reason="Откат восстановления после ошибки ролей")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        return False, "Не удалось полностью восстановить пользователя. Ник был возвращён обратно."
 
     upsert_registration(
         user_id=member.id,
@@ -907,13 +1791,14 @@ async def restore_member_from_db(member: discord.Member) -> tuple[bool, str]:
         nickname=new_nick
     )
 
-    await send_log(
-        member.guild,
-        LogType.RESTORE,
-        "Автовосстановление пользователя",
-        f"Пользователь уже был в базе.\nИмя восстановлено: **{real_name}**\nНик: **{new_nick}**",
-        member=member
-    )
+    if add_log:
+        await send_log(
+            member.guild,
+            LogType.RESTORE,
+            "Автовосстановление пользователя",
+            f"Пользователь уже был в базе.\nИмя восстановлено: **{real_name}**\nНик: **{new_nick}**",
+            member=member
+        )
 
     return True, new_nick
 
@@ -989,11 +1874,36 @@ async def execute_admin_action(
             "Он должен будет пройти регистрацию заново."
         )
 
+    if action == AdminAction.RESTORE_FROM_DB:
+        registration = get_registration(member.id, guild.id)
+        if not registration:
+            return False, "У этого пользователя нет записи в базе."
+
+        ok, result = await restore_member_from_db(
+            member=member,
+            reason_text="Администратор восстановил пользователя из базы",
+            add_log=False
+        )
+
+        if not ok:
+            return False, result
+
+        await send_log(
+            guild,
+            LogType.ADMIN,
+            "Пользователь восстановлен из базы",
+            f"Ник и роли пользователя восстановлены.\nНовый ник: **{result}**",
+            member=member,
+            moderator=moderator
+        )
+
+        return True, f"Пользователь {member.mention} восстановлен из базы.\nТекущий ник: **{result}**"
+
     return False, "Неизвестное действие."
 
 
 # =========================
-# UI
+# UI регистрации
 # =========================
 
 class NameModal(discord.ui.Modal):
@@ -1013,10 +1923,7 @@ class NameModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Неверное место",
-                    "Эту кнопку нужно использовать на сервере."
-                ),
+                embed=make_error_embed("Неверное место", "Эту кнопку нужно использовать на сервере."),
                 ephemeral=True
             )
             return
@@ -1024,36 +1931,56 @@ class NameModal(discord.ui.Modal):
         member = interaction.guild.get_member(interaction.user.id)
         if member is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Пользователь не найден",
-                    "Не удалось найти вас на сервере."
-                ),
+                embed=make_error_embed("Пользователь не найден", "Не удалось найти вас на сервере."),
                 ephemeral=True
             )
             return
 
-        ok, result = await apply_registration(
-            member=member,
-            real_name=str(self.name_input).strip(),
-            rename_mode=self.rename_mode
-        )
+        real_name = self.name_input.value.strip()
 
-        if ok:
+        allowed, spam_message = check_registration_antispam(member.id, interaction.guild.id)
+        if not allowed:
             await interaction.response.send_message(
-                embed=make_success_embed(
-                    "Готово",
-                    f"Ваш ник теперь: **{result}**"
-                ),
+                embed=make_warning_embed("Антиспам", spam_message),
                 ephemeral=True
             )
-        else:
+            return
+
+        if not begin_registration_processing(member.id, interaction.guild.id):
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Ошибка",
-                    result
-                ),
+                embed=make_warning_embed("Уже обрабатывается", "Ваш предыдущий запрос ещё обрабатывается. Подождите пару секунд."),
                 ephemeral=True
             )
+            return
+
+        try:
+            ok, result, suggestion = await apply_registration(
+                member=member,
+                real_name=real_name,
+                rename_mode=self.rename_mode
+            )
+
+            if ok:
+                extra = ""
+                if suggestion:
+                    extra = f"\nАвтоформат имени: **{real_name}** → **{suggestion}**"
+
+                await interaction.response.send_message(
+                    embed=make_success_embed("Готово", f"Ваш ник теперь: **{result}**{extra}"),
+                    ephemeral=True
+                )
+            else:
+                analysis = analyze_name(real_name)
+                hint = ""
+                if analysis["changed_case"]:
+                    hint = f"\nПодсказка: попробуйте формат **{analysis['suggested']}**"
+
+                await interaction.response.send_message(
+                    embed=make_error_embed("Ошибка", result + hint),
+                    ephemeral=True
+                )
+        finally:
+            end_registration_processing(member.id, interaction.guild.id)
 
 
 class RegistrationView(discord.ui.View):
@@ -1066,17 +1993,10 @@ class RegistrationView(discord.ui.View):
         emoji="📝",
         custom_id="registration_register"
     )
-    async def register_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ) -> None:
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Неверное место",
-                    "Эта кнопка работает только на сервере."
-                ),
+                embed=make_error_embed("Неверное место", "Эта кнопка работает только на сервере."),
                 ephemeral=True
             )
             return
@@ -1084,10 +2004,7 @@ class RegistrationView(discord.ui.View):
         member = interaction.guild.get_member(interaction.user.id)
         if member is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Пользователь не найден",
-                    "Не удалось найти вас на сервере."
-                ),
+                embed=make_error_embed("Пользователь не найден", "Не удалось найти вас на сервере."),
                 ephemeral=True
             )
             return
@@ -1095,10 +2012,7 @@ class RegistrationView(discord.ui.View):
         unregistered_role = get_unregistered_role(interaction.guild)
         if unregistered_role and unregistered_role not in member.roles:
             await interaction.response.send_message(
-                embed=make_warning_embed(
-                    "Вы уже зарегистрированы",
-                    "Используйте кнопку **«Изменить имя»**."
-                ),
+                embed=make_warning_embed("Вы уже зарегистрированы", "Используйте кнопку **«Изменить имя»**."),
                 ephemeral=True
             )
             return
@@ -1111,17 +2025,10 @@ class RegistrationView(discord.ui.View):
         emoji="✏️",
         custom_id="registration_rename"
     )
-    async def rename_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ) -> None:
+    async def rename_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Неверное место",
-                    "Эта кнопка работает только на сервере."
-                ),
+                embed=make_error_embed("Неверное место", "Эта кнопка работает только на сервере."),
                 ephemeral=True
             )
             return
@@ -1129,10 +2036,7 @@ class RegistrationView(discord.ui.View):
         member = interaction.guild.get_member(interaction.user.id)
         if member is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Пользователь не найден",
-                    "Не удалось найти вас на сервере."
-                ),
+                embed=make_error_embed("Пользователь не найден", "Не удалось найти вас на сервере."),
                 ephemeral=True
             )
             return
@@ -1140,10 +2044,7 @@ class RegistrationView(discord.ui.View):
         unregistered_role = get_unregistered_role(interaction.guild)
         if unregistered_role and unregistered_role in member.roles:
             await interaction.response.send_message(
-                embed=make_warning_embed(
-                    "Сначала регистрация",
-                    "Сначала нажмите **«Указать имя»**."
-                ),
+                embed=make_warning_embed("Сначала регистрация", "Сначала нажмите **«Указать имя»**."),
                 ephemeral=True
             )
             return
@@ -1151,28 +2052,265 @@ class RegistrationView(discord.ui.View):
         await interaction.response.send_modal(NameModal(rename_mode=True))
 
 
+# =========================
+# UI badwords
+# =========================
+
+class ConfirmClearBadwordsView(discord.ui.View):
+    def __init__(self, parent_view: "BadwordsListView", author_id: int):
+        super().__init__(timeout=120)
+        self.parent_view = parent_view
+        self.author_id = author_id
+        self.action_taken = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет доступа", "Это подтверждение предназначено не для вас."),
+                ephemeral=True
+            )
+            return False
+
+        if not is_admin_interaction(interaction):
+            await interaction.response.send_message(
+                embed=make_error_embed("Нет доступа", "У вас больше нет прав администратора."),
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(label="Да, очистить", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action_taken:
+            await interaction.response.send_message(embed=make_warning_embed("Уже обработано", "Это действие уже было выполнено."), ephemeral=True)
+            return
+
+        self.action_taken = True
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+        clear_custom_badwords()
+        self.parent_view.reload_data()
+
+        if interaction.guild is not None:
+            await send_log(
+                interaction.guild,
+                LogType.ADMIN,
+                "Очищен пользовательский список запрещённых слов",
+                "Пользовательский список запрещённых слов полностью очищен.",
+                moderator=interaction.user
+            )
+
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        self.stop()
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action_taken:
+            await interaction.response.send_message(embed=make_warning_embed("Уже обработано", "Это действие уже было выполнено."), ephemeral=True)
+            return
+
+        self.action_taken = True
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        self.stop()
+
+
+class CustomBadwordsSelect(discord.ui.Select):
+    def __init__(self, parent_view: "BadwordsListView"):
+        self.parent_view = parent_view
+        page_words = parent_view.get_page_slice()
+
+        options = [
+            discord.SelectOption(
+                label=word[:100],
+                value=word,
+                description=f"Удалить слово: {word[:50]}"
+            )
+            for word in page_words[:25]
+        ]
+
+        super().__init__(
+            placeholder="Выберите пользовательское слово для удаления...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        word = self.values[0]
+        ok, result = remove_custom_badword(word)
+
+        if not ok:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка удаления", result),
+                ephemeral=True
+            )
+            return
+
+        self.parent_view.reload_data()
+
+        if interaction.guild is not None:
+            await send_log(
+                interaction.guild,
+                LogType.ADMIN,
+                "Удалено запрещённое слово",
+                f"Из пользовательского списка удалено слово: **{result}**",
+                moderator=interaction.user
+            )
+
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class BadwordsListView(discord.ui.View):
+    def __init__(self, author_id: int, per_page: int = 15):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.per_page = per_page
+        self.page = 0
+        self.reload_data()
+
+    def reload_data(self) -> None:
+        self.default_words = get_default_badwords()
+        self.custom_words = get_custom_badwords()
+        self.max_page = max(0, (len(self.custom_words) - 1) // self.per_page)
+        if self.page > self.max_page:
+            self.page = self.max_page
+        self.refresh_components()
+
+    def get_page_slice(self) -> list[str]:
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return self.custom_words[start:end]
+
+    def build_embed(self) -> discord.Embed:
+        custom_page_words = self.get_page_slice()
+
+        default_preview = self.default_words[:15]
+        default_text = "\n".join(
+            f"**{idx}.** `{word}`" for idx, word in enumerate(default_preview, start=1)
+        )
+        if not default_text:
+            default_text = "Нет встроенных слов."
+        elif len(self.default_words) > 15:
+            default_text += f"\n\n`... и ещё {len(self.default_words) - 15}`"
+
+        custom_text = "\n".join(
+            f"**{idx}.** `{word}`"
+            for idx, word in enumerate(custom_page_words, start=self.page * self.per_page + 1)
+        )
+        if not custom_text:
+            custom_text = "Пользовательский список пуст."
+
+        embed = discord.Embed(
+            title="📛 Список запрещённых слов",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        embed.add_field(
+            name=f"Встроенный список ({len(self.default_words)})",
+            value=default_text,
+            inline=False
+        )
+        embed.add_field(
+            name=f"Пользовательский список ({len(self.custom_words)})",
+            value=custom_text,
+            inline=False
+        )
+
+        embed.set_footer(text=f"Страница пользовательского списка {self.page + 1}/{self.max_page + 1}")
+        return embed
+
+    def update_button_states(self) -> None:
+        self.prev_button.disabled = self.page <= 0 or len(self.custom_words) == 0
+        self.next_button.disabled = self.page >= self.max_page or len(self.custom_words) == 0
+        self.delete_all_button.disabled = len(self.custom_words) == 0
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+
+        if self.get_page_slice():
+            self.add_item(CustomBadwordsSelect(self))
+
+        self.add_item(self.prev_button)
+        self.add_item(self.next_button)
+        self.add_item(self.delete_all_button)
+        self.update_button_states()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет доступа", "Эта панель предназначена не для вас."),
+                ephemeral=True
+            )
+            return False
+
+        if not is_admin_interaction(interaction):
+            await interaction.response.send_message(
+                embed=make_error_embed("Нет доступа", "У вас больше нет прав администратора."),
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(label="◀ Назад", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self.refresh_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Вперёд ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self.refresh_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Очистить пользовательский список", style=discord.ButtonStyle.danger, row=1)
+    async def delete_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        confirm_view = ConfirmClearBadwordsView(self, self.author_id)
+        await interaction.response.edit_message(
+            embed=make_warning_embed(
+                "Подтверждение очистки",
+                "Вы точно хотите полностью очистить пользовательский список запрещённых слов?"
+            ),
+            view=confirm_view
+        )
+
+
+# =========================
+# UI админки
+# =========================
+
 class ConfirmAdminActionView(discord.ui.View):
-    def __init__(
-        self,
-        requester_id: int,
-        target_member_id: int,
-        action: AdminAction
-    ):
+    def __init__(self, requester_id: int, target_member_id: int, action: AdminAction):
         super().__init__(timeout=120)
         self.requester_id = requester_id
         self.target_member_id = target_member_id
         self.action = action
+        self.action_taken = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
-                embed=make_warning_embed(
-                    "Нет доступа",
-                    "Это подтверждение предназначено не для вас."
-                ),
+                embed=make_warning_embed("Нет доступа", "Это подтверждение предназначено не для вас."),
                 ephemeral=True
             )
             return False
+
+        if not is_admin_interaction(interaction):
+            await interaction.response.send_message(
+                embed=make_error_embed("Нет доступа", "У вас больше нет прав администратора."),
+                ephemeral=True
+            )
+            return False
+
         return True
 
     async def disable_all_buttons(self, message: discord.Message) -> None:
@@ -1185,17 +2323,19 @@ class ConfirmAdminActionView(discord.ui.View):
             pass
 
     @discord.ui.button(label="Подтвердить", style=discord.ButtonStyle.danger, emoji="✅")
-    async def confirm_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ) -> None:
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action_taken:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Уже обработано", "Это действие уже было выполнено."),
+                ephemeral=True
+            )
+            return
+
+        self.action_taken = True
+
         if interaction.guild is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Неверное место",
-                    "Эта кнопка работает только на сервере."
-                ),
+                embed=make_error_embed("Неверное место", "Эта кнопка работает только на сервере."),
                 ephemeral=True
             )
             return
@@ -1203,10 +2343,7 @@ class ConfirmAdminActionView(discord.ui.View):
         member = interaction.guild.get_member(self.target_member_id)
         if member is None:
             await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Пользователь не найден",
-                    "Не удалось найти пользователя на сервере."
-                ),
+                embed=make_error_embed("Пользователь не найден", "Не удалось найти пользователя на сервере."),
                 ephemeral=True
             )
             return
@@ -1218,47 +2355,446 @@ class ConfirmAdminActionView(discord.ui.View):
             moderator=interaction.user
         )
 
-        await self.disable_all_buttons(interaction.message)
+        if interaction.message is not None:
+            await self.disable_all_buttons(interaction.message)
 
         if ok:
-            await interaction.response.send_message(
-                embed=make_success_embed(
-                    "Готово",
-                    result
-                ),
-                ephemeral=True
-            )
+            await interaction.response.send_message(embed=make_success_embed("Готово", result), ephemeral=True)
         else:
-            await interaction.response.send_message(
-                embed=make_error_embed(
-                    "Ошибка",
-                    result
-                ),
-                ephemeral=True
-            )
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", result), ephemeral=True)
 
         self.stop()
 
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary, emoji="❌")
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ) -> None:
-        await self.disable_all_buttons(interaction.message)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action_taken:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Уже обработано", "Это действие уже было выполнено."),
+                ephemeral=True
+            )
+            return
+
+        self.action_taken = True
+
+        if interaction.message is not None:
+            await self.disable_all_buttons(interaction.message)
+
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "Отменено",
-                "Действие отменено."
-            ),
+            embed=make_warning_embed("Отменено", "Действие отменено."),
             ephemeral=True
         )
         self.stop()
 
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
+
+class AdminUserActionView(discord.ui.View):
+    def __init__(self, author_id: int, member_id: int):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.member_id = member_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет доступа", "Эта панель предназначена не для вас."),
+                ephemeral=True
+            )
+            return False
+
+        if not is_admin_interaction(interaction):
+            await interaction.response.send_message(
+                embed=make_error_embed("Нет доступа", "У вас больше нет прав администратора."),
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    def _get_member(self, guild: discord.Guild) -> Optional[discord.Member]:
+        return guild.get_member(self.member_id)
+
+    @discord.ui.button(label="История имени", style=discord.ButtonStyle.secondary, emoji="🕘")
+    async def history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Только на сервере."), ephemeral=True)
+            return
+
+        member = self._get_member(interaction.guild)
+        registration = get_registration(self.member_id, interaction.guild.id)
+        rows = get_name_history(self.member_id, interaction.guild.id, limit=20)
+
+        if member:
+            embed = build_name_history_embed(
+                title_text="🕘 История имён",
+                description_text=f"История для {member.mention}",
+                avatar_url=member.display_avatar.url,
+                current_real_name=registration["real_name"] if registration else None,
+                current_nickname=registration["nickname"] if registration else None,
+                rows=rows
+            )
+        else:
+            embed = build_name_history_embed(
+                title_text="🕘 История имён",
+                description_text=f"История для пользователя с ID `{self.member_id}`",
+                avatar_url=None,
+                current_real_name=registration["real_name"] if registration else None,
+                current_nickname=registration["nickname"] if registration else None,
+                rows=rows
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Восстановить из БД", style=discord.ButtonStyle.success, emoji="♻️")
+    async def restore_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Только на сервере."), ephemeral=True)
+            return
+
+        member = self._get_member(interaction.guild)
+        if member is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Пользователь не найден на сервере."), ephemeral=True)
+            return
+
+        view = ConfirmAdminActionView(
+            requester_id=interaction.user.id,
+            target_member_id=member.id,
+            action=AdminAction.RESTORE_FROM_DB
+        )
+        await interaction.response.send_message(
+            embed=make_warning_embed(
+                "Подтверждение восстановления",
+                f"Вы точно хотите восстановить ник и роли пользователя {member.mention} из базы?"
+            ),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Сбросить", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Только на сервере."), ephemeral=True)
+            return
+
+        member = self._get_member(interaction.guild)
+        if member is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Пользователь не найден на сервере."), ephemeral=True)
+            return
+
+        view = ConfirmAdminActionView(
+            requester_id=interaction.user.id,
+            target_member_id=member.id,
+            action=AdminAction.RESET_DB_USER
+        )
+        await interaction.response.send_message(
+            embed=make_warning_embed("Подтверждение сброса", f"Вы точно хотите сбросить регистрацию пользователя {member.mention}?"),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Удалить из БД", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Только на сервере."), ephemeral=True)
+            return
+
+        member = self._get_member(interaction.guild)
+        if member is None:
+            await interaction.response.send_message(embed=make_error_embed("Ошибка", "Пользователь не найден на сервере."), ephemeral=True)
+            return
+
+        view = ConfirmAdminActionView(
+            requester_id=interaction.user.id,
+            target_member_id=member.id,
+            action=AdminAction.DELETE_DB_USER
+        )
+        await interaction.response.send_message(
+            embed=make_warning_embed("Подтверждение удаления", f"Вы точно хотите удалить **{member}** из базы?"),
+            view=view,
+            ephemeral=True
+        )
+
+
+class AdminUserSelect(discord.ui.Select):
+    def __init__(self, author_id: int, guild_id: int):
+        self.author_id = author_id
+        self.guild_id = guild_id
+        rows = get_last_registrations(guild_id, limit=25)
+
+        options = []
+        for row in rows:
+            label = row["real_name"][:100]
+            description = f"{row['discord_name']} • {row['user_id']}"
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=str(row["user_id"]),
+                    description=description[:100]
+                )
+            )
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Нет записей",
+                    value="0",
+                    description="В базе пока нет зарегистрированных пользователей."
+                )
+            ]
+
+        super().__init__(
+            placeholder="Выберите пользователя из последних регистраций...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+            disabled=(len(rows) == 0)
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта панель работает только на сервере."),
+                ephemeral=True
+            )
+            return
+
+        if self.values[0] == "0":
+            await interaction.response.send_message(
+                embed=make_warning_embed("База пуста", "В базе нет пользователей для выбора."),
+                ephemeral=True
+            )
+            return
+
+        user_id = int(self.values[0])
+        member = interaction.guild.get_member(user_id)
+        registration = get_registration(user_id, interaction.guild.id)
+
+        if registration is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Не удалось найти запись пользователя в базе."),
+                ephemeral=True
+            )
+            return
+
+        if member is not None:
+            embed = build_user_db_embed_from_member(member, registration)
+        else:
+            embed = build_user_db_embed_offline(user_id, registration)
+
+        view = AdminUserActionView(author_id=interaction.user.id, member_id=user_id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self, author_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.add_item(AdminUserSelect(author_id, guild_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет доступа", "Эта админ-панель предназначена не для вас."),
+                ephemeral=True
+            )
+            return False
+
+        if not is_admin_interaction(interaction):
+            await interaction.response.send_message(
+                embed=make_error_embed("Нет доступа", "У вас больше нет прав администратора."),
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(label="System Check", style=discord.ButtonStyle.primary, emoji="🧪", row=1)
+    async def system_check_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта кнопка работает только на сервере."),
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(embed=build_system_check_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="Последние регистрации", style=discord.ButtonStyle.secondary, emoji="📚", row=1)
+    async def recent_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта кнопка работает только на сервере."),
+                ephemeral=True
+            )
+            return
+
+        rows = get_last_registrations(interaction.guild.id, limit=10)
+        if not rows:
+            await interaction.response.send_message(
+                embed=make_warning_embed("База пуста", "В базе пока нет зарегистрированных пользователей."),
+                ephemeral=True
+            )
+            return
+
+        lines = []
+        for idx, row in enumerate(rows, start=1):
+            lines.append(
+                f"**{idx}.** <@{row['user_id']}>\n"
+                f"Имя: **{row['real_name']}**\n"
+                f"Ник: `{row['nickname']}`\n"
+                f"Обновлено: `{format_dt(row['updated_at'])}`"
+            )
+
+        embed = discord.Embed(
+            title="📚 Последние регистрации",
+            description="\n\n".join(lines),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text=f"Показано записей: {len(rows)}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Экспорт БД", style=discord.ButtonStyle.success, emoji="📦", row=1)
+    async def export_db_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта кнопка работает только на сервере."),
+                ephemeral=True
+            )
+            return
+
+        file_path = export_registrations_to_csv(interaction.guild.id)
+        if file_path is None:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет данных", "В базе нет записей для экспорта."),
+                ephemeral=True
+            )
+            return
+
+        await send_log(
+            interaction.guild,
+            LogType.ADMIN,
+            "Экспорт базы",
+            f"База регистраций экспортирована в CSV.\nФайл: **{file_path.name}**",
+            moderator=interaction.user
+        )
+
+        await interaction.response.send_message(
+            embed=make_success_embed("Экспорт готов", "CSV-файл с регистрациями прикреплён ниже."),
+            file=discord.File(file_path),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Badwords", style=discord.ButtonStyle.secondary, emoji="📛", row=2)
+    async def badwords_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = BadwordsListView(author_id=interaction.user.id, per_page=15)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Обновить регистрацию", style=discord.ButtonStyle.success, emoji="🛡️", row=2)
+    async def setup_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта кнопка работает только на сервере."),
+                ephemeral=True
+            )
+            return
+
+        msg = await ensure_registration_message(interaction.guild)
+        if msg is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Не удалось создать или найти сообщение регистрации."),
+                ephemeral=True
+            )
+            return
+
+        await refresh_registration_message(interaction.guild)
+        await interaction.response.send_message(
+            embed=make_success_embed("Готово", "Постоянное сообщение регистрации создано или обновлено."),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Сделать бэкап", style=discord.ButtonStyle.primary, emoji="💾", row=2)
+    async def backup_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка", "Эта кнопка работает только на сервере."),
+                ephemeral=True
+            )
+            return
+
+        try:
+            files = create_backup_bundle()
+        except Exception as e:
+            log_internal_exception("Ручной бэкап", e)
+            await interaction.response.send_message(
+                embed=make_error_embed("Ошибка бэкапа", "Не удалось создать бэкап. Подробности сохранены во внутренних логах."),
+                ephemeral=True
+            )
+            return
+
+        if not files:
+            await interaction.response.send_message(
+                embed=make_warning_embed("Нет файлов", "Не найдено файлов для резервного копирования."),
+                ephemeral=True
+            )
+            return
+
+        names = "\n".join(f"• `{file.name}`" for file in files)
+
+        await send_log(
+            interaction.guild,
+            LogType.BACKUP,
+            "Создан бэкап",
+            f"Создано архивов: **{len(files)}**\n{names}",
+            moderator=interaction.user
+        )
+
+        await interaction.response.send_message(
+            embed=make_success_embed("Бэкап создан", f"Создано архивов: **{len(files)}**\n{names}"),
+            ephemeral=True
+        )
+
+
+# =========================
+# Автобэкап
+# =========================
+
+@tasks.loop(minutes=10)
+async def auto_backup_loop():
+    global LAST_AUTO_BACKUP_AT
+
+    interval_hours = get_backup_interval_hours()
+    now = datetime.now(timezone.utc)
+
+    if LAST_AUTO_BACKUP_AT is not None:
+        if now - LAST_AUTO_BACKUP_AT < timedelta(hours=interval_hours):
+            return
+
+    try:
+        files = create_backup_bundle()
+    except Exception as e:
+        log_internal_exception("Ошибка автобэкапа", e)
+        return
+
+    if not files:
+        return
+
+    LAST_AUTO_BACKUP_AT = now
+    save_last_auto_backup_at(now)
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        names = "\n".join(f"• `{file.name}`" for file in files)
+        await send_log(
+            guild,
+            LogType.BACKUP,
+            "Автобэкап выполнен",
+            f"Создано архивов: **{len(files)}**\n{names}"
+        )
+
+
+@auto_backup_loop.before_loop
+async def before_auto_backup_loop():
+    await bot.wait_until_ready()
 
 
 # =========================
@@ -1267,27 +2803,66 @@ class ConfirmAdminActionView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    init_db()
     bot.add_view(RegistrationView())
 
-    guild_obj = discord.Object(id=GUILD_ID)
-    try:
-        synced = await bot.tree.sync(guild=guild_obj)
-        print(f"Синхронизировано slash-команд: {len(synced)}")
-    except Exception as e:
-        print(f"Ошибка синхронизации slash-команд: {e}")
+    if GUILD_ID:
+        guild_obj = discord.Object(id=GUILD_ID)
+        try:
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f"Синхронизировано slash-команд: {len(synced)}")
+        except Exception as e:
+            log_internal_exception("Ошибка синхронизации slash-команд", e)
 
-    real_guild = bot.get_guild(GUILD_ID)
-    if real_guild is not None:
-        await ensure_registration_message(real_guild)
-        await refresh_registration_message(real_guild)
+        real_guild = bot.get_guild(GUILD_ID)
+        if real_guild is not None:
+            await ensure_registration_message(real_guild)
+            await refresh_registration_message(real_guild)
+
+    if not auto_backup_loop.is_running():
+        auto_backup_loop.start()
 
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
 
 
 @bot.event
+async def on_message(message: discord.Message):
+    if message.guild is None:
+        await bot.process_commands(message)
+        return
+
+    registration_channel = get_registration_channel(message.guild)
+    registration_message_id = int(config.get("registration_message_id", 0) or 0)
+
+    if registration_channel and message.channel.id == registration_channel.id:
+        if message.author.bot:
+            await bot.process_commands(message)
+            return
+
+        if message.id == registration_message_id:
+            await bot.process_commands(message)
+            return
+
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+        try:
+            await message.channel.send(
+                f"{message.author.mention}, в этом канале нельзя писать сообщения. Используйте кнопки Verification выше.",
+                delete_after=8
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    await bot.process_commands(message)
+
+
+@bot.event
 async def on_member_join(member: discord.Member):
-    if member.guild.id != GUILD_ID:
+    if not GUILD_ID or member.guild.id != GUILD_ID:
         return
 
     registration = get_registration(member.id, member.guild.id)
@@ -1296,17 +2871,6 @@ async def on_member_join(member: discord.Member):
         ok, result = await restore_member_from_db(member)
 
         if ok:
-            try:
-                await member.send(
-                    embed=make_success_embed(
-                        "С возвращением",
-                        f"Вы уже были зарегистрированы ранее.\n"
-                        f"Ваше имя восстановлено автоматически.\n"
-                        f"Текущий ник: **{result}**"
-                    )
-                )
-            except discord.Forbidden:
-                pass
             return
         else:
             await send_log(
@@ -1326,20 +2890,9 @@ async def on_member_join(member: discord.Member):
                 reason="Новый пользователь ожидает регистрацию"
             )
         except discord.Forbidden:
-            print("Нет прав на выдачу роли 'Не зарегистрирован'.")
+            print("Нет прав на выдачу роли незарегистрированного.")
         except discord.HTTPException as e:
             print(f"Ошибка Discord при выдаче роли: {e}")
-
-    try:
-        await member.send(
-            embed=make_info_embed(
-                "Добро пожаловать",
-                "Чтобы завершить регистрацию, перейдите в канал регистрации на сервере "
-                "и нажмите кнопку **«Указать имя»**."
-            )
-        )
-    except discord.Forbidden:
-        pass
 
     await send_log(
         member.guild,
@@ -1363,10 +2916,7 @@ async def on_member_join(member: discord.Member):
 async def setup_registration_slash(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1374,23 +2924,142 @@ async def setup_registration_slash(interaction: discord.Interaction):
     msg = await ensure_registration_message(interaction.guild)
     if msg is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Ошибка",
-                "Не удалось создать или найти сообщение регистрации."
-            ),
+            embed=make_error_embed("Ошибка", "Не удалось создать или найти сообщение регистрации."),
             ephemeral=True
         )
         return
 
     await refresh_registration_message(interaction.guild)
-
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Готово",
-            "Постоянное сообщение регистрации создано или обновлено."
-        ),
+        embed=make_success_embed("Готово", "Постоянное сообщение регистрации создано или обновлено."),
         ephemeral=True
     )
+
+
+@bot.tree.command(
+    name="admin_panel",
+    description="Открыть красивую админ-панель",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_panel_slash(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
+            ephemeral=True
+        )
+        return
+
+    count = count_registrations(interaction.guild.id)
+    embed = discord.Embed(
+        title="🛠️ Админ-панель",
+        description=(
+            f"Зарегистрированных в базе: **{count}**\n\n"
+            "• **Select-menu** сверху — быстро открыть пользователя из базы\n"
+            "• **System Check** — проверить права, роли и каналы\n"
+            "• **Последние регистрации** — показать последние записи\n"
+            "• **Экспорт БД** — выгрузить CSV\n"
+            "• **Badwords** — открыть список запрещённых слов\n"
+            "• **Обновить регистрацию** — обновить сообщение регистрации\n"
+            "• **Сделать бэкап** — создать резервную копию вручную"
+        ),
+        color=discord.Color.dark_teal(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text="Панель доступна только вам")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=AdminPanelView(author_id=interaction.user.id, guild_id=interaction.guild.id),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="system_check",
+    description="Проверить права бота, роли и каналы",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def system_check_slash(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(embed=build_system_check_embed(interaction.guild), ephemeral=True)
+
+
+@bot.tree.command(
+    name="check_name",
+    description="Проверить, пропустит ли бот имя",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def check_name_slash(interaction: discord.Interaction, name: str):
+    analysis = analyze_name(name)
+
+    color = discord.Color.green() if analysis["ok"] else discord.Color.red()
+    status = "✅ Имя пройдёт проверку" if analysis["ok"] else "⚠️ Имя не пройдёт проверку"
+
+    embed = discord.Embed(
+        title="🔎 Проверка имени",
+        description=status,
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Введено", value=f"`{analysis['original']}`", inline=False)
+    embed.add_field(name="Автоформат", value=f"`{analysis['suggested']}`", inline=False)
+    embed.add_field(name="Формат", value="✅ корректный" if analysis["valid"] else "❌ некорректный", inline=True)
+    embed.add_field(name="Антимат", value="❌ найдено совпадение" if analysis["found_profanity"] else "✅ не найдено", inline=True)
+
+    if analysis["matched_rule"]:
+        embed.add_field(name="Совпадение", value=f"`{analysis['matched_rule']}`", inline=False)
+
+    if analysis["reason"]:
+        embed.add_field(name="Причина", value=analysis["reason"], inline=False)
+
+    if analysis["changed_case"]:
+        embed.add_field(name="Подсказка", value=f"Лучше использовать: **{analysis['suggested']}**", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="name_history",
+    description="Показать историю смен имени пользователя",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def name_history_slash(interaction: discord.Interaction, member: discord.Member):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
+            ephemeral=True
+        )
+        return
+
+    rows = get_name_history(member.id, interaction.guild.id, limit=20)
+    registration = get_registration(member.id, interaction.guild.id)
+
+    if not rows and not registration:
+        await interaction.response.send_message(
+            embed=make_warning_embed("Нет данных", "У пользователя нет истории имён и записи о регистрации."),
+            ephemeral=True
+        )
+        return
+
+    embed = build_name_history_embed(
+        title_text="🕘 История имён",
+        description_text=f"История для {member.mention}",
+        avatar_url=member.display_avatar.url,
+        current_real_name=registration["real_name"] if registration else None,
+        current_nickname=registration["nickname"] if registration else None,
+        rows=rows
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1399,10 +3068,7 @@ async def setup_registration_slash(interaction: discord.Interaction):
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_registration_channel_slash(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
+async def set_registration_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
     config["registration_channel_id"] = channel.id
     config["registration_message_id"] = 0
     save_config(config)
@@ -1423,18 +3089,12 @@ async def set_registration_channel_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_log_channel_slash(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
+async def set_log_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
     config["log_channel_id"] = channel.id
     save_config(config)
 
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Настройки обновлены",
-            f"Лог-канал изменён на {channel.mention}."
-        ),
+        embed=make_success_embed("Настройки обновлены", f"Лог-канал изменён на {channel.mention}."),
         ephemeral=True
     )
 
@@ -1445,18 +3105,12 @@ async def set_log_channel_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_welcome_channel_slash(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
+async def set_welcome_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
     config["welcome_channel_id"] = channel.id
     save_config(config)
 
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Настройки обновлены",
-            f"Welcome-канал изменён на {channel.mention}."
-        ),
+        embed=make_success_embed("Настройки обновлены", f"Welcome-канал изменён на {channel.mention}."),
         ephemeral=True
     )
 
@@ -1467,18 +3121,15 @@ async def set_welcome_channel_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_unregistered_role_slash(
-    interaction: discord.Interaction,
-    role: discord.Role
-):
+async def set_unregistered_role_slash(interaction: discord.Interaction, role: discord.Role):
     config["unregistered_role_id"] = role.id
     save_config(config)
 
+    if interaction.guild is not None:
+        await refresh_registration_message(interaction.guild)
+
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Настройки обновлены",
-            f"Роль незарегистрированных изменена на **{role.name}**."
-        ),
+        embed=make_success_embed("Настройки обновлены", f"Роль незарегистрированных изменена на **{role.name}**."),
         ephemeral=True
     )
 
@@ -1489,18 +3140,15 @@ async def set_unregistered_role_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_member_role_slash(
-    interaction: discord.Interaction,
-    role: discord.Role
-):
+async def set_member_role_slash(interaction: discord.Interaction, role: discord.Role):
     config["member_role_id"] = role.id
     save_config(config)
 
+    if interaction.guild is not None:
+        await refresh_registration_message(interaction.guild)
+
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Настройки обновлены",
-            f"Роль участников изменена на **{role.name}**."
-        ),
+        embed=make_success_embed("Настройки обновлены", f"Роль участников изменена на **{role.name}**."),
         ephemeral=True
     )
 
@@ -1511,18 +3159,90 @@ async def set_member_role_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def set_rename_cooldown_slash(
-    interaction: discord.Interaction,
-    hours: app_commands.Range[int, 0]
-):
+async def set_rename_cooldown_slash(interaction: discord.Interaction, hours: app_commands.Range[int, 0]):
     config["rename_cooldown_hours"] = hours
     save_config(config)
 
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Настройки обновлены",
-            f"Задержка между сменами имени: **{hours} ч.**"
-        ),
+        embed=make_success_embed("Настройки обновлены", f"Задержка между сменами имени: **{hours} ч.**"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="set_backup_interval",
+    description="Установить интервал автобэкапа в часах",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_backup_interval_slash(interaction: discord.Interaction, hours: app_commands.Range[int, 1, 168]):
+    config["backup_interval_hours"] = hours
+    save_config(config)
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Настройки обновлены", f"Интервал автобэкапа: **{hours} ч.**"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="set_backup_max_files",
+    description="Установить число хранимых файлов автобэкапа",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_backup_max_files_slash(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
+    config["backup_max_files"] = count
+    save_config(config)
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Настройки обновлены", f"Максимум архивов бэкапа: **{count}**"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="backup_now",
+    description="Создать резервную копию прямо сейчас",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def backup_now_slash(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
+            ephemeral=True
+        )
+        return
+
+    try:
+        files = create_backup_bundle()
+    except Exception as e:
+        await interaction.response.send_message(
+            embed=make_error_embed("Ошибка бэкапа", "Не удалось создать бэкап. Подробности сохранены во внутренних логах."),
+            ephemeral=True
+        )
+        return
+
+    if not files:
+        await interaction.response.send_message(
+            embed=make_warning_embed("Нет файлов", "Не найдено файлов для резервного копирования."),
+            ephemeral=True
+        )
+        return
+
+    names = "\n".join(f"• `{file.name}`" for file in files)
+
+    await send_log(
+        interaction.guild,
+        LogType.BACKUP,
+        "Создан бэкап вручную",
+        f"Создано архивов: **{len(files)}**\n{names}",
+        moderator=interaction.user
+    )
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Бэкап создан", f"Создано архивов: **{len(files)}**\n{names}"),
         ephemeral=True
     )
 
@@ -1533,16 +3253,10 @@ async def set_rename_cooldown_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def whois_slash(
-    interaction: discord.Interaction,
-    member: discord.Member
-):
+async def whois_slash(interaction: discord.Interaction, member: discord.Member):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1550,29 +3264,13 @@ async def whois_slash(
     registration = get_registration(member.id, interaction.guild.id)
     if not registration:
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "Нет данных",
-                "Этот пользователь ещё не зарегистрирован в базе."
-            ),
+            embed=make_warning_embed("Нет данных", "Этот пользователь ещё не зарегистрирован в базе."),
             ephemeral=True
         )
         return
 
-    embed = discord.Embed(
-        title="🧾 Информация о пользователе",
-        description=f"Данные регистрации для {member.mention}",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Discord username", value=registration["discord_name"], inline=False)
-    embed.add_field(name="Указанное имя", value=registration["real_name"], inline=False)
-    embed.add_field(name="Текущий ник", value=registration["nickname"], inline=False)
-    embed.add_field(name="Первая регистрация", value=format_dt(registration["registered_at"]), inline=False)
-    embed.add_field(name="Последнее обновление", value=format_dt(registration["updated_at"]), inline=False)
-    embed.set_footer(text="Просмотр данных пользователя")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    view = AdminUserActionView(author_id=interaction.user.id, member_id=member.id)
+    await interaction.response.send_message(embed=build_user_db_embed_from_member(member, registration), view=view, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1584,29 +3282,14 @@ async def whois_slash(
 async def registrations_count_slash(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*) AS count
-        FROM registrations
-        WHERE guild_id = ?
-    """, (interaction.guild.id,))
-    row = cur.fetchone()
-    conn.close()
-
+    count = count_registrations(interaction.guild.id)
     await interaction.response.send_message(
-        embed=make_info_embed(
-            "Статистика",
-            f"Всего зарегистрированных пользователей: **{row['count']}**"
-        ),
+        embed=make_info_embed("Статистика", f"Всего зарегистрированных пользователей: **{count}**"),
         ephemeral=True
     )
 
@@ -1617,16 +3300,10 @@ async def registrations_count_slash(interaction: discord.Interaction):
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def db_user_slash(
-    interaction: discord.Interaction,
-    member: discord.Member
-):
+async def db_user_slash(interaction: discord.Interaction, member: discord.Member):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1634,29 +3311,13 @@ async def db_user_slash(
     registration = get_registration(member.id, interaction.guild.id)
     if not registration:
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "Запись не найдена",
-                "У этого пользователя нет записи в базе."
-            ),
+            embed=make_warning_embed("Запись не найдена", "У этого пользователя нет записи в базе."),
             ephemeral=True
         )
         return
 
-    embed = discord.Embed(
-        title="🗂️ Запись пользователя в базе",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Пользователь", value=f"{member.mention}\n`{member.id}`", inline=False)
-    embed.add_field(name="Discord username", value=registration["discord_name"], inline=True)
-    embed.add_field(name="Имя", value=registration["real_name"], inline=True)
-    embed.add_field(name="Ник", value=registration["nickname"], inline=False)
-    embed.add_field(name="Первая регистрация", value=format_dt(registration["registered_at"]), inline=False)
-    embed.add_field(name="Последнее обновление", value=format_dt(registration["updated_at"]), inline=False)
-    embed.set_footer(text="Database Viewer")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    view = AdminUserActionView(author_id=interaction.user.id, member_id=member.id)
+    await interaction.response.send_message(embed=build_user_db_embed_from_member(member, registration), view=view, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1665,16 +3326,10 @@ async def db_user_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def db_recent_slash(
-    interaction: discord.Interaction,
-    limit: app_commands.Range[int, 1, 20] = 10
-):
+async def db_recent_slash(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1682,10 +3337,7 @@ async def db_recent_slash(
     rows = get_last_registrations(interaction.guild.id, limit=limit)
     if not rows:
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "База пуста",
-                "В базе пока нет зарегистрированных пользователей."
-            ),
+            embed=make_warning_embed("База пуста", "В базе пока нет зарегистрированных пользователей."),
             ephemeral=True
         )
         return
@@ -1706,7 +3358,6 @@ async def db_recent_slash(
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text=f"Показано записей: {len(rows)}")
-
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1719,10 +3370,7 @@ async def db_recent_slash(
 async def db_export_slash(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1730,10 +3378,7 @@ async def db_export_slash(interaction: discord.Interaction):
     file_path = export_registrations_to_csv(interaction.guild.id)
     if file_path is None:
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "Нет данных",
-                "В базе нет записей для экспорта."
-            ),
+            embed=make_warning_embed("Нет данных", "В базе нет записей для экспорта."),
             ephemeral=True
         )
         return
@@ -1747,10 +3392,7 @@ async def db_export_slash(interaction: discord.Interaction):
     )
 
     await interaction.response.send_message(
-        embed=make_success_embed(
-            "Экспорт готов",
-            "CSV-файл с регистрациями прикреплён ниже."
-        ),
+        embed=make_success_embed("Экспорт готов", "CSV-файл с регистрациями прикреплён ниже."),
         file=discord.File(file_path),
         ephemeral=True
     )
@@ -1762,16 +3404,10 @@ async def db_export_slash(interaction: discord.Interaction):
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def db_delete_user_slash(
-    interaction: discord.Interaction,
-    member: discord.Member
-):
+async def db_delete_user_slash(interaction: discord.Interaction, member: discord.Member):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1779,10 +3415,7 @@ async def db_delete_user_slash(
     registration = get_registration(member.id, interaction.guild.id)
     if not registration:
         await interaction.response.send_message(
-            embed=make_warning_embed(
-                "Нечего удалять",
-                "У этого пользователя нет записи в базе."
-            ),
+            embed=make_warning_embed("Нечего удалять", "У этого пользователя нет записи в базе."),
             ephemeral=True
         )
         return
@@ -1810,16 +3443,10 @@ async def db_delete_user_slash(
     guild=discord.Object(id=GUILD_ID)
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def db_reset_user_slash(
-    interaction: discord.Interaction,
-    member: discord.Member
-):
+async def db_reset_user_slash(interaction: discord.Interaction, member: discord.Member):
     if interaction.guild is None:
         await interaction.response.send_message(
-            embed=make_error_embed(
-                "Неверное место",
-                "Эта команда работает только на сервере."
-            ),
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
             ephemeral=True
         )
         return
@@ -1841,17 +3468,236 @@ async def db_reset_user_slash(
     )
 
 
+@bot.tree.command(
+    name="db_restore_user",
+    description="Восстановить ник и роли пользователя из базы",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def db_restore_user_slash(interaction: discord.Interaction, member: discord.Member):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверное место", "Эта команда работает только на сервере."),
+            ephemeral=True
+        )
+        return
+
+    registration = get_registration(member.id, interaction.guild.id)
+    if not registration:
+        await interaction.response.send_message(
+            embed=make_warning_embed("Нет записи", "У этого пользователя нет записи в базе."),
+            ephemeral=True
+        )
+        return
+
+    view = ConfirmAdminActionView(
+        requester_id=interaction.user.id,
+        target_member_id=member.id,
+        action=AdminAction.RESTORE_FROM_DB
+    )
+
+    await interaction.response.send_message(
+        embed=make_warning_embed(
+            "Подтверждение восстановления",
+            f"Вы точно хотите восстановить ник и роли пользователя {member.mention} из базы?"
+        ),
+        view=view,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="badwords_add",
+    description="Добавить слово в пользовательский список запрещённых слов",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def badwords_add_slash(interaction: discord.Interaction, word: str):
+    ok, result = add_custom_badword(word)
+
+    if not ok:
+        await interaction.response.send_message(
+            embed=make_warning_embed("Не добавлено", result),
+            ephemeral=True
+        )
+        return
+
+    if interaction.guild is not None:
+        await send_log(
+            interaction.guild,
+            LogType.ADMIN,
+            "Добавлено запрещённое слово",
+            f"В пользовательский список добавлено слово: **{result}**",
+            moderator=interaction.user
+        )
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Слово добавлено", f"Добавлено слово: **{result}**"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="badwords_remove",
+    description="Удалить слово из пользовательского списка запрещённых слов",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def badwords_remove_slash(interaction: discord.Interaction, word: str):
+    ok, result = remove_custom_badword(word)
+
+    if not ok:
+        await interaction.response.send_message(
+            embed=make_warning_embed("Не удалено", result),
+            ephemeral=True
+        )
+        return
+
+    if interaction.guild is not None:
+        await send_log(
+            interaction.guild,
+            LogType.ADMIN,
+            "Удалено запрещённое слово",
+            f"Из пользовательского списка удалено слово: **{result}**",
+            moderator=interaction.user
+        )
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Слово удалено", f"Удалено слово: **{result}**"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="badwords_list",
+    description="Показать встроенный и пользовательский список запрещённых слов",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def badwords_list_slash(interaction: discord.Interaction):
+    view = BadwordsListView(author_id=interaction.user.id, per_page=15)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+
+@bot.tree.command(
+    name="badwords_export",
+    description="Экспортировать списки запрещённых слов в JSON",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def badwords_export_slash(interaction: discord.Interaction):
+    file_path = export_badwords_to_json()
+
+    if interaction.guild is not None:
+        await send_log(
+            interaction.guild,
+            LogType.ADMIN,
+            "Экспорт списка запрещённых слов",
+            f"Списки запрещённых слов экспортированы.\nФайл: **{file_path.name}**",
+            moderator=interaction.user
+        )
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Экспорт готов", "JSON-файл со списками слов прикреплён ниже."),
+        file=discord.File(file_path),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="badwords_import",
+    description="Импортировать пользовательский список запрещённых слов из JSON-файла",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def badwords_import_slash(interaction: discord.Interaction, file: discord.Attachment):
+    if not file.filename.lower().endswith(".json"):
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверный файл", "Нужен JSON-файл."),
+            ephemeral=True
+        )
+        return
+
+    try:
+        file_bytes = await file.read()
+        data = json.loads(file_bytes.decode("utf-8-sig"))
+    except Exception:
+        await interaction.response.send_message(
+            embed=make_error_embed("Ошибка чтения", "Не удалось прочитать JSON-файл."),
+            ephemeral=True
+        )
+        return
+
+    if not isinstance(data, dict):
+        await interaction.response.send_message(
+            embed=make_error_embed("Неверный формат", "JSON должен быть объектом."),
+            ephemeral=True
+        )
+        return
+
+    words = data.get("custom_words", data.get("words"))
+    if not isinstance(words, list):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "Неверный формат",
+                "JSON должен содержать поле `custom_words` или `words` со списком слов."
+            ),
+            ephemeral=True
+        )
+        return
+
+    cleaned_words = []
+    seen = set()
+    default_words = set(get_default_badwords())
+
+    for word in words:
+        if not isinstance(word, str):
+            continue
+        normalized = normalize_custom_badword(word)
+        if (
+            normalized
+            and len(normalized) >= 3
+            and normalized not in seen
+            and normalized not in default_words
+        ):
+            cleaned_words.append(normalized)
+            seen.add(normalized)
+
+    save_badwords({"words": sorted(cleaned_words)})
+
+    if interaction.guild is not None:
+        await send_log(
+            interaction.guild,
+            LogType.ADMIN,
+            "Импорт пользовательского списка запрещённых слов",
+            f"Импортировано слов: **{len(cleaned_words)}**",
+            moderator=interaction.user
+        )
+
+    await interaction.response.send_message(
+        embed=make_success_embed("Импорт завершён", f"Импортировано пользовательских слов: **{len(cleaned_words)}**"),
+        ephemeral=True
+    )
+
+
 # =========================
 # Ошибки
 # =========================
 
 @setup_registration_slash.error
+@admin_panel_slash.error
+@system_check_slash.error
+@check_name_slash.error
+@name_history_slash.error
 @set_registration_channel_slash.error
 @set_log_channel_slash.error
 @set_welcome_channel_slash.error
 @set_unregistered_role_slash.error
 @set_member_role_slash.error
 @set_rename_cooldown_slash.error
+@set_backup_interval_slash.error
+@set_backup_max_files_slash.error
+@backup_now_slash.error
 @whois_slash.error
 @registrations_count_slash.error
 @db_user_slash.error
@@ -1859,19 +3705,23 @@ async def db_reset_user_slash(
 @db_export_slash.error
 @db_delete_user_slash.error
 @db_reset_user_slash.error
-async def slash_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError
-):
+@db_restore_user_slash.error
+@badwords_add_slash.error
+@badwords_remove_slash.error
+@badwords_list_slash.error
+@badwords_export_slash.error
+@badwords_import_slash.error
+async def slash_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         message_embed = make_error_embed(
             "Нет доступа",
             "У вас нет прав администратора для этой команды."
         )
     else:
+        log_internal_exception("Slash command error", error)
         message_embed = make_error_embed(
             "Ошибка",
-            str(error)
+            "Произошла внутренняя ошибка. Подробности скрыты от пользователей и выведены в консоль бота."
         )
 
     if interaction.response.is_done():
@@ -1882,6 +3732,7 @@ async def slash_command_error(
 
 if not TOKEN:
     raise ValueError("Не найден DISCORD_TOKEN в .env")
+
 
 if __name__ == "__main__":
     init_db()
